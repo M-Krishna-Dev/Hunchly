@@ -1,3 +1,9 @@
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
+
 import { InteractionType, InteractionResponseType } from "discord-api-types/v10";
 import { verifyKey } from "discord-interactions";
 import { MongoClient } from "mongodb";
@@ -8,24 +14,28 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const COMPONENTS_V2_FLAG = 1 << 15;
 const EPHEMERAL_FLAG = 1 << 6;
 
-const BEATS = {
-  rock: "scissors",
-  paper: "rock",
-  scissors: "paper",
-};
-
 let cachedClient = null;
 
-async function getCollection() {
+async function getDb() {
   if (!cachedClient) {
     cachedClient = new MongoClient(MONGODB_URI);
     await cachedClient.connect();
   }
-  return cachedClient.db("rps").collection("leaderboard");
+  return cachedClient.db("numguess");
+}
+
+async function getGamesCol() {
+  const db = await getDb();
+  return db.collection("games");
+}
+
+async function getLeaderboardCol() {
+  const db = await getDb();
+  return db.collection("leaderboard");
 }
 
 async function incrementWins(guildId, userId) {
-  const col = await getCollection();
+  const col = await getLeaderboardCol();
   await col.updateOne(
     { guildId, userId },
     { $inc: { wins: 1 } },
@@ -33,17 +43,9 @@ async function incrementWins(guildId, userId) {
   );
 }
 
-async function removeIfZeroWins(guildId, userId) {
-  const col = await getCollection();
-  await col.deleteOne({ guildId, userId, wins: { $lte: 0 } });
-}
-
 async function getLeaderboard(guildId) {
-  const col = await getCollection();
-  return await col
-    .find({ guildId, wins: { $gt: 0 } })
-    .sort({ wins: -1 })
-    .toArray();
+  const col = await getLeaderboardCol();
+  return col.find({ guildId, wins: { $gt: 0 } }).sort({ wins: -1 }).toArray();
 }
 
 async function getUserRank(guildId, userId) {
@@ -53,15 +55,19 @@ async function getUserRank(guildId, userId) {
   return { rank: idx + 1, score: all[idx].wins };
 }
 
-async function removeUserFromGuild(guildId, userId) {
-  const col = await getCollection();
-  await col.deleteOne({ guildId, userId });
+async function saveGame(gameId, data) {
+  const col = await getGamesCol();
+  await col.updateOne({ gameId }, { $set: { gameId, ...data } }, { upsert: true });
 }
 
-function getResult(a, b) {
-  if (a === b) return "draw";
-  if (BEATS[a] === b) return "a";
-  return "b";
+async function getGame(gameId) {
+  const col = await getGamesCol();
+  return col.findOne({ gameId });
+}
+
+async function deleteGame(gameId) {
+  const col = await getGamesCol();
+  await col.deleteOne({ gameId });
 }
 
 function ephemeral(content) {
@@ -69,21 +75,125 @@ function ephemeral(content) {
     type: InteractionResponseType.ChannelMessageWithSource,
     data: {
       flags: EPHEMERAL_FLAG | COMPONENTS_V2_FLAG,
-      components: [
-        {
-          type: 17,
-          components: [{ type: 10, content }],
-        },
-      ],
+      components: [{ type: 17, components: [{ type: 10, content }] }],
     },
   };
 }
 
+function buildChallengeComponents(challengerId, opponentId) {
+  return [
+    {
+      type: 17,
+      components: [
+        {
+          type: 10,
+          content: `## Number Guessing Game\n<@${challengerId}> has challenged <@${opponentId}>!\n<@${opponentId}>, do you accept?`,
+        },
+        {
+          type: 1,
+          components: [
+            { type: 2, style: 3, label: "Accept", custom_id: `ng_accept:${challengerId}:${opponentId}` },
+            { type: 2, style: 4, label: "Decline", custom_id: `ng_decline:${challengerId}:${opponentId}` },
+          ],
+        },
+      ],
+    },
+  ];
+}
+
+function buildSetNumberPrompt(setterId, guesserId, round) {
+  return [
+    {
+      type: 17,
+      components: [
+        {
+          type: 10,
+          content: `## Round ${round} — Set Your Number\n<@${setterId}>, pick a secret number between **1 and 100**.\nOnly you can see this — <@${guesserId}> will try to guess it.`,
+        },
+        {
+          type: 1,
+          components: [
+            { type: 2, style: 1, label: "Set Number", custom_id: `ng_set_modal:${setterId}:${guesserId}:${round}` },
+          ],
+        },
+      ],
+    },
+  ];
+}
+
+function buildGuessPrompt(guesserId, setterId, round, guessCount, hint) {
+  const hintLine = hint ? `\nHint: **${hint}**` : "";
+  return [
+    {
+      type: 17,
+      components: [
+        {
+          type: 10,
+          content: `## Round ${round} — Guess the Number\n<@${guesserId}>, guess the number between **1 and 100**!${hintLine}\nGuesses so far: \`${guessCount}\``,
+        },
+        {
+          type: 1,
+          components: [
+            { type: 2, style: 1, label: "Make a Guess", custom_id: `ng_guess_modal:${setterId}:${guesserId}:${round}` },
+          ],
+        },
+      ],
+    },
+  ];
+}
+
+function buildRoundResultComponents(setterId, guesserId, guesses, round, nextSetterId, nextGuesserId) {
+  return [
+    {
+      type: 17,
+      components: [
+        {
+          type: 10,
+          content: `## Round ${round} Complete\n<@${guesserId}> guessed the number in **${guesses} guess${guesses !== 1 ? "es" : ""}**!`,
+        },
+        { type: 14, divider: true },
+        {
+          type: 10,
+          content: `Now roles swap. <@${nextSetterId}> will set a number and <@${nextGuesserId}> will guess.`,
+        },
+        {
+          type: 1,
+          components: [
+            { type: 2, style: 1, label: "Continue to Round 2", custom_id: `ng_start_round2:${nextSetterId}:${nextGuesserId}` },
+          ],
+        },
+      ],
+    },
+  ];
+}
+
+function buildFinalResultComponents(guildId, p1Id, p1Guesses, p2Id, p2Guesses, winnerId) {
+  const outcomeText =
+    p1Guesses === p2Guesses
+      ? "It's a **draw**! Nobody wins this round."
+      : `<@${winnerId}> wins with fewer guesses!`;
+
+  return [
+    {
+      type: 17,
+      components: [
+        { type: 10, content: "## Game Over — Final Result" },
+        { type: 14, divider: true },
+        {
+          type: 10,
+          content: `<@${p1Id}> took **${p1Guesses} guess${p1Guesses !== 1 ? "es" : ""}**\n<@${p2Id}> took **${p2Guesses} guess${p2Guesses !== 1 ? "es" : ""}**`,
+        },
+        { type: 14, divider: true },
+        { type: 10, content: outcomeText },
+      ],
+    },
+  ];
+}
+
 function buildLeaderboardComponents(allEntries, userRank) {
   const top10 = allEntries.slice(0, 10);
-
   const footerText = userRank
-    ? `-# You are ranked #${userRank.rank} with a score of \`${userRank.score}\`.`
+    ? `-# You are ranked #${userRank.rank} with \`${userRank.score}\` wins.`
     : `-# You are not ranked yet.`;
 
   if (top10.length === 0) {
@@ -100,7 +210,7 @@ function buildLeaderboardComponents(allEntries, userRank) {
   }
 
   const rows = top10
-    .map((entry, i) => `${i + 1}. <@${entry.userId}> \`${entry.wins}\``)
+    .map((entry, i) => `${i + 1}. <@${entry.userId}>・\`${entry.wins}\``)
     .join("\n");
 
   return [
@@ -117,76 +227,8 @@ function buildLeaderboardComponents(allEntries, userRank) {
   ];
 }
 
-function buildChallengeComponents(challengerId, opponentId) {
-  return [
-    {
-      type: 17,
-      components: [
-        {
-          type: 10,
-          content: `## Rock Paper Scissors\n<@${challengerId}> has challenged <@${opponentId}>!\n<@${opponentId}>, pick your move:`,
-        },
-        {
-          type: 1,
-          components: [
-            { type: 2, style: 1, label: "Rock",     custom_id: `rps_move:${challengerId}:${opponentId}:rock`     },
-            { type: 2, style: 1, label: "Paper",    custom_id: `rps_move:${challengerId}:${opponentId}:paper`    },
-            { type: 2, style: 1, label: "Scissors", custom_id: `rps_move:${challengerId}:${opponentId}:scissors` },
-          ],
-        },
-      ],
-    },
-  ];
-}
-
-function buildChallengerPickComponents(challengerId, opponentId, opponentMove) {
-  return [
-    {
-      type: 17,
-      components: [
-        {
-          type: 10,
-          content: `## Rock Paper Scissors\n<@${opponentId}> has picked. <@${challengerId}>, now pick your move:`,
-        },
-        {
-          type: 1,
-          components: [
-            { type: 2, style: 1, label: "Rock",     custom_id: `rps_challenger:${challengerId}:${opponentId}:${opponentMove}:rock`     },
-            { type: 2, style: 1, label: "Paper",    custom_id: `rps_challenger:${challengerId}:${opponentId}:${opponentMove}:paper`    },
-            { type: 2, style: 1, label: "Scissors", custom_id: `rps_challenger:${challengerId}:${opponentId}:${opponentMove}:scissors` },
-          ],
-        },
-      ],
-    },
-  ];
-}
-
-function buildResultComponents(challengerId, challengerMove, opponentId, opponentMove, result) {
-  const label = { rock: "Rock", paper: "Paper", scissors: "Scissors" };
-  const outcome =
-    result === "draw"
-      ? "It's a **draw**!"
-      : result === "a"
-      ? `<@${challengerId}> wins!`
-      : `<@${opponentId}> wins!`;
-
-  return [
-    {
-      type: 17,
-      components: [
-        {
-          type: 10,
-          content: `## Rock Paper Scissors — Result\n<@${challengerId}> played **${label[challengerMove]}**\n<@${opponentId}> played **${label[opponentMove]}**\n\n${outcome}`,
-        },
-      ],
-    },
-  ];
-}
-
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).end("Method Not Allowed");
-  }
+  if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
   const signature = req.headers["x-signature-ed25519"];
   const timestamp = req.headers["x-signature-timestamp"];
@@ -195,8 +237,7 @@ export default async function handler(req, res) {
   for await (const chunk of req) chunks.push(chunk);
   const rawBody = Buffer.concat(chunks).toString("utf8");
 
-  const isValid = verifyKey(rawBody, signature, timestamp, PUBLIC_KEY);
-  if (!isValid) {
+  if (!verifyKey(rawBody, signature, timestamp, PUBLIC_KEY)) {
     return res.status(401).end("Invalid signature");
   }
 
@@ -207,36 +248,26 @@ export default async function handler(req, res) {
   }
 
   const guildId = interaction.guild_id;
-
-  if (interaction.type === InteractionType.GuildMemberRemove) {
-    const userId = interaction.data?.user?.id;
-    if (userId && guildId) {
-      await removeUserFromGuild(guildId, userId);
-    }
-    return res.status(200).end();
-  }
+  const userId = interaction.member?.user?.id || interaction.user?.id;
 
   if (interaction.type === InteractionType.ApplicationCommand) {
     const { name } = interaction.data;
 
-    if (name === "challenge") {
+    if (name === "guess") {
       const targetUser = interaction.data.options?.find((o) => o.name === "user")?.value;
-      const challengerId = interaction.member?.user?.id || interaction.user?.id;
-
       if (!targetUser) return res.json(ephemeral("You must mention a user to challenge."));
-      if (targetUser === challengerId) return res.json(ephemeral("You cannot challenge yourself."));
+      if (targetUser === userId) return res.json(ephemeral("You cannot challenge yourself."));
 
       return res.json({
         type: InteractionResponseType.ChannelMessageWithSource,
         data: {
           flags: COMPONENTS_V2_FLAG,
-          components: buildChallengeComponents(challengerId, targetUser),
+          components: buildChallengeComponents(userId, targetUser),
         },
       });
     }
 
     if (name === "leaderboard") {
-      const userId = interaction.member?.user?.id || interaction.user?.id;
       const allEntries = await getLeaderboard(guildId);
       const userRank = await getUserRank(guildId, userId);
       return res.json({
@@ -252,47 +283,216 @@ export default async function handler(req, res) {
 
   if (interaction.type === InteractionType.MessageComponent) {
     const customId = interaction.data.custom_id;
-    const userId = interaction.member?.user?.id || interaction.user?.id;
+    const parts = customId.split(":");
 
-    if (customId.startsWith("rps_move:")) {
-      const parts = customId.split(":");
+    if (customId.startsWith("ng_decline:")) {
       const challengerId = parts[1];
       const opponentId = parts[2];
-      const opponentMove = parts[3];
+      if (userId !== opponentId) return res.json(ephemeral("This is not your challenge."));
+      return res.json({
+        type: InteractionResponseType.UpdateMessage,
+        data: {
+          flags: COMPONENTS_V2_FLAG,
+          components: [
+            {
+              type: 17,
+              components: [
+                { type: 10, content: `## Number Guessing Game\n<@${opponentId}> declined the challenge.` },
+              ],
+            },
+          ],
+        },
+      });
+    }
 
-      if (userId !== opponentId) return res.json(ephemeral("This challenge is not for you."));
+    if (customId.startsWith("ng_accept:")) {
+      const challengerId = parts[1];
+      const opponentId = parts[2];
+      if (userId !== opponentId) return res.json(ephemeral("This is not your challenge."));
 
       return res.json({
         type: InteractionResponseType.UpdateMessage,
         data: {
           flags: COMPONENTS_V2_FLAG,
-          components: buildChallengerPickComponents(challengerId, opponentId, opponentMove),
+          components: buildSetNumberPrompt(challengerId, opponentId, 1),
         },
       });
     }
 
-    if (customId.startsWith("rps_challenger:")) {
-      const parts = customId.split(":");
-      const challengerId = parts[1];
-      const opponentId = parts[2];
-      const opponentMove = parts[3];
-      const challengerMove = parts[4];
+    if (customId.startsWith("ng_set_modal:")) {
+      const setterId = parts[1];
+      const guesserId = parts[2];
+      const round = parseInt(parts[3]);
+      if (userId !== setterId) return res.json(ephemeral("Only the setter can pick a number."));
 
-      if (userId !== challengerId) return res.json(ephemeral("This challenge is not for you."));
+      return res.json({
+        type: 5,
+        data: {
+          custom_id: `ng_set_submit:${setterId}:${guesserId}:${round}`,
+          title: `Round ${round} — Set Your Number`,
+          components: [
+            {
+              type: 1,
+              components: [
+                {
+                  type: 4,
+                  custom_id: "number",
+                  label: "Enter a number between 1 and 100",
+                  style: 1,
+                  min_length: 1,
+                  max_length: 3,
+                  required: true,
+                },
+              ],
+            },
+          ],
+        },
+      });
+    }
 
-      const result = getResult(challengerMove, opponentMove);
+    if (customId.startsWith("ng_guess_modal:")) {
+      const setterId = parts[1];
+      const guesserId = parts[2];
+      const round = parseInt(parts[3]);
+      if (userId !== guesserId) return res.json(ephemeral("Only the guesser can guess."));
 
-      if (result === "a") {
-        await incrementWins(guildId, challengerId);
-      } else if (result === "b") {
-        await incrementWins(guildId, opponentId);
+      return res.json({
+        type: 5,
+        data: {
+          custom_id: `ng_guess_submit:${setterId}:${guesserId}:${round}`,
+          title: `Round ${round} — Make a Guess`,
+          components: [
+            {
+              type: 1,
+              components: [
+                {
+                  type: 4,
+                  custom_id: "guess",
+                  label: "Your guess (1–100)",
+                  style: 1,
+                  min_length: 1,
+                  max_length: 3,
+                  required: true,
+                },
+              ],
+            },
+          ],
+        },
+      });
+    }
+
+    if (customId.startsWith("ng_start_round2:")) {
+      const setterId = parts[1];
+      const guesserId = parts[2];
+      if (userId !== setterId && userId !== guesserId) {
+        return res.json(ephemeral("You are not part of this game."));
       }
 
       return res.json({
         type: InteractionResponseType.UpdateMessage,
         data: {
           flags: COMPONENTS_V2_FLAG,
-          components: buildResultComponents(challengerId, challengerMove, opponentId, opponentMove, result),
+          components: buildSetNumberPrompt(setterId, guesserId, 2),
+        },
+      });
+    }
+  }
+
+  if (interaction.type === InteractionType.ModalSubmit) {
+    const customId = interaction.data.custom_id;
+    const parts = customId.split(":");
+
+    if (customId.startsWith("ng_set_submit:")) {
+      const setterId = parts[1];
+      const guesserId = parts[2];
+      const round = parseInt(parts[3]);
+
+      const raw = interaction.data.components[0].components[0].value.trim();
+      const secret = parseInt(raw);
+
+      if (isNaN(secret) || secret < 1 || secret > 100) {
+        return res.json(ephemeral("Invalid number. Pick a number between 1 and 100."));
+      }
+
+      const gameId = `${guildId}:${setterId}:${guesserId}:${round}`;
+      await saveGame(gameId, { setterId, guesserId, guildId, secret, guessCount: 0, round });
+
+      return res.json({
+        type: InteractionResponseType.ChannelMessageWithSource,
+        data: {
+          flags: COMPONENTS_V2_FLAG,
+          components: buildGuessPrompt(guesserId, setterId, round, 0, null),
+          allowed_mentions: { parse: [] },
+        },
+      });
+    }
+
+    if (customId.startsWith("ng_guess_submit:")) {
+      const setterId = parts[1];
+      const guesserId = parts[2];
+      const round = parseInt(parts[3]);
+
+      const raw = interaction.data.components[0].components[0].value.trim();
+      const guess = parseInt(raw);
+
+      if (isNaN(guess) || guess < 1 || guess > 100) {
+        return res.json(ephemeral("Invalid guess. Pick a number between 1 and 100."));
+      }
+
+      const gameId = `${guildId}:${setterId}:${guesserId}:${round}`;
+      const game = await getGame(gameId);
+      if (!game) return res.json(ephemeral("Game not found. The setter must set a number first."));
+
+      const newCount = game.guessCount + 1;
+      await saveGame(gameId, { ...game, guessCount: newCount });
+
+      if (guess === game.secret) {
+        await deleteGame(gameId);
+
+        if (round === 1) {
+          // ✅ FIXED: save round 1 result so round 2 can retrieve it
+          await saveGame(`r1result:${guildId}:${setterId}:${guesserId}`, { guessCount: newCount });
+
+          return res.json({
+            type: InteractionResponseType.ChannelMessageWithSource,
+            data: {
+              flags: COMPONENTS_V2_FLAG,
+              components: buildRoundResultComponents(setterId, guesserId, newCount, 1, guesserId, setterId),
+              allowed_mentions: { parse: [] },
+            },
+          });
+        } else {
+          // round 2: retrieve round 1 result — note roles are swapped so key uses guesserId:setterId
+          const round1Data = await getGame(`r1result:${guildId}:${guesserId}:${setterId}`);
+          const p1Guesses = round1Data?.guessCount || 0;
+          const p2Guesses = newCount;
+
+          await deleteGame(`r1result:${guildId}:${guesserId}:${setterId}`);
+
+          let winnerId = null;
+          if (p1Guesses !== p2Guesses) {
+            winnerId = p1Guesses < p2Guesses ? guesserId : setterId;
+            await incrementWins(guildId, winnerId);
+          }
+
+          return res.json({
+            type: InteractionResponseType.ChannelMessageWithSource,
+            data: {
+              flags: COMPONENTS_V2_FLAG,
+              components: buildFinalResultComponents(guildId, guesserId, p1Guesses, setterId, p2Guesses, winnerId),
+              allowed_mentions: { parse: [] },
+            },
+          });
+        }
+      }
+
+      const hint = guess < game.secret ? "Go higher" : "Go lower";
+      return res.json({
+        type: InteractionResponseType.ChannelMessageWithSource,
+        data: {
+          flags: COMPONENTS_V2_FLAG,
+          components: buildGuessPrompt(guesserId, setterId, round, newCount, hint),
+          allowed_mentions: { parse: [] },
         },
       });
     }
