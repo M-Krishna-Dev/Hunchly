@@ -1,9 +1,3 @@
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
-
 import { InteractionType, InteractionResponseType } from "discord-api-types/v10";
 import { verifyKey } from "discord-interactions";
 import { MongoClient } from "mongodb";
@@ -15,6 +9,15 @@ const COMPONENTS_V2_FLAG = 1 << 15;
 const EPHEMERAL_FLAG = 1 << 6;
 
 let cachedClient = null;
+
+function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
 
 async function getDb() {
   if (!cachedClient) {
@@ -233,9 +236,8 @@ export default async function handler(req, res) {
   const signature = req.headers["x-signature-ed25519"];
   const timestamp = req.headers["x-signature-timestamp"];
 
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const rawBody = Buffer.concat(chunks).toString("utf8");
+  // ✅ FIXED: use event-based body reading instead of async iterator
+  const rawBody = await getRawBody(req);
 
   if (!verifyKey(rawBody, signature, timestamp, PUBLIC_KEY)) {
     return res.status(401).end("Invalid signature");
@@ -450,7 +452,6 @@ export default async function handler(req, res) {
         await deleteGame(gameId);
 
         if (round === 1) {
-          // ✅ FIXED: save round 1 result so round 2 can retrieve it
           await saveGame(`r1result:${guildId}:${setterId}:${guesserId}`, { guessCount: newCount });
 
           return res.json({
@@ -462,7 +463,6 @@ export default async function handler(req, res) {
             },
           });
         } else {
-          // round 2: retrieve round 1 result — note roles are swapped so key uses guesserId:setterId
           const round1Data = await getGame(`r1result:${guildId}:${guesserId}:${setterId}`);
           const p1Guesses = round1Data?.guessCount || 0;
           const p2Guesses = newCount;
