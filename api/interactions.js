@@ -41,7 +41,7 @@ async function incrementWins(guildId, userId) {
   const col = await getLeaderboardCol();
   await col.updateOne(
     { guildId, userId },
-    { $inc: { wins: 1 } },
+    { inc: { wins: 1 } },
     { upsert: true }
   );
 }
