@@ -73,19 +73,6 @@ async function deleteGame(gameId) {
   await col.deleteOne({ gameId });
 }
 
-// ─── Helper: resolve userId from any interaction type ───────────────────────
-function resolveUserId(interaction) {
-  // In guild context, member.user.id is the correct field
-  // In DM context, user.id is used
-  return (
-    interaction.member?.user?.id ??
-    interaction.user?.id ??
-    null
-  );
-}
-
-// ─── Response builders ───────────────────────────────────────────────────────
-
 function ephemeral(content) {
   return {
     type: InteractionResponseType.ChannelMessageWithSource,
@@ -129,12 +116,7 @@ function buildSetNumberPrompt(setterId, guesserId, round) {
         {
           type: 1,
           components: [
-            {
-              type: 2,
-              style: 1,
-              label: "Set Number",
-              custom_id: `ng_set_modal:${setterId}:${guesserId}:${round}`,
-            },
+            { type: 2, style: 1, label: "Set Number", custom_id: `ng_set_modal:${setterId}:${guesserId}:${round}` },
           ],
         },
       ],
@@ -155,12 +137,7 @@ function buildGuessPrompt(guesserId, setterId, round, guessCount, hint) {
         {
           type: 1,
           components: [
-            {
-              type: 2,
-              style: 1,
-              label: "Make a Guess",
-              custom_id: `ng_guess_modal:${setterId}:${guesserId}:${round}`,
-            },
+            { type: 2, style: 1, label: "Make a Guess", custom_id: `ng_guess_modal:${setterId}:${guesserId}:${round}` },
           ],
         },
       ],
@@ -185,12 +162,7 @@ function buildRoundResultComponents(setterId, guesserId, guesses, round, nextSet
         {
           type: 1,
           components: [
-            {
-              type: 2,
-              style: 1,
-              label: "Continue to Round 2",
-              custom_id: `ng_start_round2:${nextSetterId}:${nextGuesserId}`,
-            },
+            { type: 2, style: 1, label: "Continue to Round 2", custom_id: `ng_start_round2:${nextSetterId}:${nextGuesserId}` },
           ],
         },
       ],
@@ -258,330 +230,285 @@ function buildLeaderboardComponents(allEntries, userRank) {
   ];
 }
 
-// ─── Main handler ─────────────────────────────────────────────────────────────
-
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
+  try {
+    if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
-  const signature = req.headers["x-signature-ed25519"];
-  const timestamp = req.headers["x-signature-timestamp"];
-  const rawBody = await getRawBody(req);
+    const signature = req.headers["x-signature-ed25519"];
+    const timestamp = req.headers["x-signature-timestamp"];
 
-  if (!verifyKey(rawBody, signature, timestamp, PUBLIC_KEY)) {
-    return res.status(401).end("Invalid signature");
-  }
+    const rawBody = await getRawBody(req);
 
-  const interaction = JSON.parse(rawBody);
-
-  if (interaction.type === InteractionType.Ping) {
-    return res.json({ type: InteractionResponseType.Pong });
-  }
-
-  const guildId = interaction.guild_id;
-
-  // FIX: use dedicated resolver so userId is never undefined
-  const userId = resolveUserId(interaction);
-  if (!userId) {
-    console.error("Could not resolve userId from interaction:", JSON.stringify(interaction, null, 2));
-    return res.status(400).end("Could not resolve user ID");
-  }
-
-  // ─── Slash Commands ─────────────────────────────────────────────────────────
-  if (interaction.type === InteractionType.ApplicationCommand) {
-    const { name } = interaction.data;
-
-    if (name === "guess") {
-      const targetUser = interaction.data.options?.find((o) => o.name === "user")?.value;
-      if (!targetUser) return res.json(ephemeral("You must mention a user to challenge."));
-      if (targetUser === userId) return res.json(ephemeral("You cannot challenge yourself."));
-
-      return res.json({
-        type: InteractionResponseType.ChannelMessageWithSource,
-        data: {
-          flags: COMPONENTS_V2_FLAG,
-          components: buildChallengeComponents(userId, targetUser),
-        },
-      });
+    if (!verifyKey(rawBody, signature, timestamp, PUBLIC_KEY)) {
+      return res.status(401).end("Invalid signature");
     }
 
-    if (name === "leaderboard") {
-      const allEntries = await getLeaderboard(guildId);
-      const userRank = await getUserRank(guildId, userId);
-      return res.json({
-        type: InteractionResponseType.ChannelMessageWithSource,
-        data: {
-          flags: COMPONENTS_V2_FLAG,
-          components: buildLeaderboardComponents(allEntries, userRank),
-          allowed_mentions: { parse: [] },
-        },
-      });
-    }
-  }
+    const interaction = JSON.parse(rawBody);
 
-  // ─── Message Components (buttons) ───────────────────────────────────────────
-  if (interaction.type === InteractionType.MessageComponent) {
-    const customId = interaction.data.custom_id;
-    const parts = customId.split(":");
-
-    // ── Decline challenge ──────────────────────────────────────────────────
-    if (customId.startsWith("ng_decline:")) {
-      const challengerId = parts[1];
-      const opponentId = parts[2];
-      if (userId !== opponentId) return res.json(ephemeral("This is not your challenge."));
-      return res.json({
-        type: InteractionResponseType.UpdateMessage,
-        data: {
-          flags: COMPONENTS_V2_FLAG,
-          components: [
-            {
-              type: 17,
-              components: [
-                {
-                  type: 10,
-                  content: `## Number Guessing Game\n<@${opponentId}> declined the challenge.`,
-                },
-              ],
-            },
-          ],
-        },
-      });
+    if (interaction.type === InteractionType.Ping) {
+      return res.json({ type: InteractionResponseType.Pong });
     }
 
-    // ── Accept challenge ───────────────────────────────────────────────────
-    if (customId.startsWith("ng_accept:")) {
-      const challengerId = parts[1];
-      const opponentId = parts[2];
-      if (userId !== opponentId) return res.json(ephemeral("This is not your challenge."));
+    const guildId = interaction.guild_id;
+    const userId = interaction.member?.user?.id || interaction.user?.id;
 
-      // FIX: post a NEW public message for the set-number prompt instead of
-      // updating the challenge message. This prevents the setter from being
-      // blocked by the message author mismatch in ephemeral/update flows,
-      // and keeps the challenge message intact as a record.
-      return res.json({
-        type: InteractionResponseType.ChannelMessageWithSource,
-        data: {
-          flags: COMPONENTS_V2_FLAG,
-          components: buildSetNumberPrompt(challengerId, opponentId, 1),
-          allowed_mentions: { parse: [] },
-        },
-      });
-    }
+    console.log("Interaction type:", interaction.type);
+    console.log("userId:", userId);
+    console.log("customId:", interaction.data?.custom_id);
 
-    // ── Open "Set Number" modal ────────────────────────────────────────────
-    if (customId.startsWith("ng_set_modal:")) {
-      const setterId = parts[1];
-      const guesserId = parts[2];
-      const round = parseInt(parts[3]);
+    if (interaction.type === InteractionType.ApplicationCommand) {
+      const { name } = interaction.data;
 
-      // FIX: clear error message tells setter if they click the wrong button
-      if (userId !== setterId) {
-        return res.json(ephemeral(`Only <@${setterId}> can set the number for this round.`));
+      if (name === "guess") {
+        const targetUser = interaction.data.options?.find((o) => o.name === "user")?.value;
+        if (!targetUser) return res.json(ephemeral("You must mention a user to challenge."));
+        if (targetUser === userId) return res.json(ephemeral("You cannot challenge yourself."));
+
+        return res.json({
+          type: InteractionResponseType.ChannelMessageWithSource,
+          data: {
+            flags: COMPONENTS_V2_FLAG,
+            components: buildChallengeComponents(userId, targetUser),
+          },
+        });
       }
 
-      return res.json({
-        type: 5, // MODAL
-        data: {
-          custom_id: `ng_set_submit:${setterId}:${guesserId}:${round}`,
-          title: `Round ${round} — Set Your Number`,
-          components: [
-            {
-              type: 1,
-              components: [
-                {
-                  type: 4,
-                  custom_id: "number",
-                  label: "Enter a number between 1 and 100",
-                  style: 1,
-                  min_length: 1,
-                  max_length: 3,
-                  required: true,
-                },
-              ],
-            },
-          ],
-        },
-      });
+      if (name === "leaderboard") {
+        const allEntries = await getLeaderboard(guildId);
+        const userRank = await getUserRank(guildId, userId);
+        return res.json({
+          type: InteractionResponseType.ChannelMessageWithSource,
+          data: {
+            flags: COMPONENTS_V2_FLAG,
+            components: buildLeaderboardComponents(allEntries, userRank),
+            allowed_mentions: { parse: [] },
+          },
+        });
+      }
     }
 
-    // ── Open "Make a Guess" modal ──────────────────────────────────────────
-    if (customId.startsWith("ng_guess_modal:")) {
-      const setterId = parts[1];
-      const guesserId = parts[2];
-      const round = parseInt(parts[3]);
+    if (interaction.type === InteractionType.MessageComponent) {
+      const customId = interaction.data.custom_id;
+      const parts = customId.split(":");
 
-      if (userId !== guesserId) {
-        return res.json(ephemeral(`Only <@${guesserId}> can guess this round.`));
+      if (customId.startsWith("ng_decline:")) {
+        const challengerId = parts[1];
+        const opponentId = parts[2];
+        if (userId !== opponentId) return res.json(ephemeral("This is not your challenge."));
+        return res.json({
+          type: InteractionResponseType.UpdateMessage,
+          data: {
+            flags: COMPONENTS_V2_FLAG,
+            components: [
+              {
+                type: 17,
+                components: [
+                  { type: 10, content: `## Number Guessing Game\n<@${opponentId}> declined the challenge.` },
+                ],
+              },
+            ],
+          },
+        });
       }
 
-      return res.json({
-        type: 5, // MODAL
-        data: {
-          custom_id: `ng_guess_submit:${setterId}:${guesserId}:${round}`,
-          title: `Round ${round} — Make a Guess`,
-          components: [
-            {
-              type: 1,
-              components: [
-                {
-                  type: 4,
-                  custom_id: "guess",
-                  label: "Your guess (1–100)",
-                  style: 1,
-                  min_length: 1,
-                  max_length: 3,
-                  required: true,
-                },
-              ],
-            },
-          ],
-        },
-      });
-    }
+      if (customId.startsWith("ng_accept:")) {
+        const challengerId = parts[1];
+        const opponentId = parts[2];
+        if (userId !== opponentId) return res.json(ephemeral("This is not your challenge."));
 
-    // ── Start round 2 ─────────────────────────────────────────────────────
-    if (customId.startsWith("ng_start_round2:")) {
-      const setterId = parts[1];
-      const guesserId = parts[2];
-      if (userId !== setterId && userId !== guesserId) {
-        return res.json(ephemeral("You are not part of this game."));
+        return res.json({
+          type: InteractionResponseType.UpdateMessage,
+          data: {
+            flags: COMPONENTS_V2_FLAG,
+            components: buildSetNumberPrompt(challengerId, opponentId, 1),
+          },
+        });
       }
 
-      return res.json({
-        type: InteractionResponseType.UpdateMessage,
-        data: {
-          flags: COMPONENTS_V2_FLAG,
-          components: buildSetNumberPrompt(setterId, guesserId, 2),
-          allowed_mentions: { parse: [] },
-        },
-      });
-    }
-  }
+      if (customId.startsWith("ng_set_modal:")) {
+        const setterId = parts[1];
+        const guesserId = parts[2];
+        const round = parseInt(parts[3]);
 
-  // ─── Modal Submissions ───────────────────────────────────────────────────────
-  if (interaction.type === InteractionType.ModalSubmit) {
-    const customId = interaction.data.custom_id;
-    const parts = customId.split(":");
+        console.log("ng_set_modal — userId:", userId, "setterId:", setterId);
 
-    // ── Save secret number ─────────────────────────────────────────────────
-    if (customId.startsWith("ng_set_submit:")) {
-      const setterId = parts[1];
-      const guesserId = parts[2];
-      const round = parseInt(parts[3]);
+        if (userId !== setterId) return res.json(ephemeral("Only the setter can pick a number."));
 
-      // Guard: only the setter should be submitting this modal
-      if (userId !== setterId) {
-        return res.json(ephemeral("You are not the setter for this round."));
+        return res.json({
+          type: 5,
+          data: {
+            custom_id: `ng_set_submit:${setterId}:${guesserId}:${round}`,
+            title: `Round ${round} — Set Your Number`,
+            components: [
+              {
+                type: 1,
+                components: [
+                  {
+                    type: 4,
+                    custom_id: "number",
+                    label: "Enter a number between 1 and 100",
+                    style: 1,
+                    min_length: 1,
+                    max_length: 3,
+                    required: true,
+                  },
+                ],
+              },
+            ],
+          },
+        });
       }
 
-      const raw = interaction.data.components[0].components[0].value.trim();
-      const secret = parseInt(raw);
+      if (customId.startsWith("ng_guess_modal:")) {
+        const setterId = parts[1];
+        const guesserId = parts[2];
+        const round = parseInt(parts[3]);
+        if (userId !== guesserId) return res.json(ephemeral("Only the guesser can guess."));
 
-      if (isNaN(secret) || secret < 1 || secret > 100) {
-        return res.json(ephemeral("Invalid number. Pick a number between 1 and 100."));
+        return res.json({
+          type: 5,
+          data: {
+            custom_id: `ng_guess_submit:${setterId}:${guesserId}:${round}`,
+            title: `Round ${round} — Make a Guess`,
+            components: [
+              {
+                type: 1,
+                components: [
+                  {
+                    type: 4,
+                    custom_id: "guess",
+                    label: "Your guess (1–100)",
+                    style: 1,
+                    min_length: 1,
+                    max_length: 3,
+                    required: true,
+                  },
+                ],
+              },
+            ],
+          },
+        });
       }
 
-      const gameId = `${guildId}:${setterId}:${guesserId}:${round}`;
-      await saveGame(gameId, { setterId, guesserId, guildId, secret, guessCount: 0, round });
-
-      return res.json({
-        type: InteractionResponseType.ChannelMessageWithSource,
-        data: {
-          flags: COMPONENTS_V2_FLAG,
-          components: buildGuessPrompt(guesserId, setterId, round, 0, null),
-          allowed_mentions: { parse: [] },
-        },
-      });
-    }
-
-    // ── Process guess ──────────────────────────────────────────────────────
-    if (customId.startsWith("ng_guess_submit:")) {
-      const setterId = parts[1];
-      const guesserId = parts[2];
-      const round = parseInt(parts[3]);
-
-      // Guard: only the guesser should be submitting this modal
-      if (userId !== guesserId) {
-        return res.json(ephemeral("You are not the guesser for this round."));
-      }
-
-      const raw = interaction.data.components[0].components[0].value.trim();
-      const guess = parseInt(raw);
-
-      if (isNaN(guess) || guess < 1 || guess > 100) {
-        return res.json(ephemeral("Invalid guess. Pick a number between 1 and 100."));
-      }
-
-      const gameId = `${guildId}:${setterId}:${guesserId}:${round}`;
-      const game = await getGame(gameId);
-      if (!game) return res.json(ephemeral("Game not found. The setter must set a number first."));
-
-      const newCount = game.guessCount + 1;
-      await saveGame(gameId, { ...game, guessCount: newCount });
-
-      if (guess === game.secret) {
-        await deleteGame(gameId);
-
-        if (round === 1) {
-          // Store round 1 result keyed by the original player order (challenger = p1)
-          await saveGame(`r1result:${guildId}:${setterId}:${guesserId}`, { guessCount: newCount });
-
-          return res.json({
-            type: InteractionResponseType.ChannelMessageWithSource,
-            data: {
-              flags: COMPONENTS_V2_FLAG,
-              // Roles swap: round-1 guesser becomes setter, round-1 setter becomes guesser
-              components: buildRoundResultComponents(setterId, guesserId, newCount, 1, guesserId, setterId),
-              allowed_mentions: { parse: [] },
-            },
-          });
-        } else {
-          // Round 2 done — look up round 1 result
-          // In round 1: setterId was the challenger, guesserId was the opponent
-          // In round 2 (roles swapped): setterId is now the original opponent, guesserId is original challenger
-          // The r1result key was saved as: r1result:guildId:round1Setter:round1Guesser
-          // round1Setter = original challengerId = round2 guesserId
-          // round1Guesser = original opponentId = round2 setterId
-          const r1Key = `r1result:${guildId}:${guesserId}:${setterId}`;
-          const round1Data = await getGame(r1Key);
-          const p1Guesses = round1Data?.guessCount ?? 0;
-          const p2Guesses = newCount;
-
-          await deleteGame(r1Key);
-
-          // p1 = original challenger (guesserId in round 2)
-          // p2 = original opponent (setterId in round 2)
-          const p1Id = guesserId;
-          const p2Id = setterId;
-
-          let winnerId = null;
-          if (p1Guesses !== p2Guesses) {
-            winnerId = p1Guesses < p2Guesses ? p1Id : p2Id;
-            await incrementWins(guildId, winnerId);
-          }
-
-          return res.json({
-            type: InteractionResponseType.ChannelMessageWithSource,
-            data: {
-              flags: COMPONENTS_V2_FLAG,
-              components: buildFinalResultComponents(guildId, p1Id, p1Guesses, p2Id, p2Guesses, winnerId),
-              allowed_mentions: { parse: [] },
-            },
-          });
+      if (customId.startsWith("ng_start_round2:")) {
+        const setterId = parts[1];
+        const guesserId = parts[2];
+        if (userId !== setterId && userId !== guesserId) {
+          return res.json(ephemeral("You are not part of this game."));
         }
+
+        return res.json({
+          type: InteractionResponseType.UpdateMessage,
+          data: {
+            flags: COMPONENTS_V2_FLAG,
+            components: buildSetNumberPrompt(setterId, guesserId, 2),
+          },
+        });
+      }
+    }
+
+    if (interaction.type === InteractionType.ModalSubmit) {
+      const customId = interaction.data.custom_id;
+      const parts = customId.split(":");
+
+      if (customId.startsWith("ng_set_submit:")) {
+        const setterId = parts[1];
+        const guesserId = parts[2];
+        const round = parseInt(parts[3]);
+
+        const raw = interaction.data.components[0].components[0].value.trim();
+        const secret = parseInt(raw);
+
+        if (isNaN(secret) || secret < 1 || secret > 100) {
+          return res.json(ephemeral("Invalid number. Pick a number between 1 and 100."));
+        }
+
+        const gameId = `${guildId}:${setterId}:${guesserId}:${round}`;
+        await saveGame(gameId, { setterId, guesserId, guildId, secret, guessCount: 0, round });
+
+        return res.json({
+          type: InteractionResponseType.ChannelMessageWithSource,
+          data: {
+            flags: COMPONENTS_V2_FLAG,
+            components: buildGuessPrompt(guesserId, setterId, round, 0, null),
+            allowed_mentions: { parse: [] },
+          },
+        });
       }
 
-      // Wrong guess — send a hint
-      const hint = guess < game.secret ? "Go higher" : "Go lower";
-      return res.json({
-        type: InteractionResponseType.ChannelMessageWithSource,
-        data: {
-          flags: COMPONENTS_V2_FLAG,
-          components: buildGuessPrompt(guesserId, setterId, round, newCount, hint),
-          allowed_mentions: { parse: [] },
-        },
-      });
-    }
-  }
+      if (customId.startsWith("ng_guess_submit:")) {
+        const setterId = parts[1];
+        const guesserId = parts[2];
+        const round = parseInt(parts[3]);
 
-  return res.status(400).end("Unknown interaction");
+        const raw = interaction.data.components[0].components[0].value.trim();
+        const guess = parseInt(raw);
+
+        if (isNaN(guess) || guess < 1 || guess > 100) {
+          return res.json(ephemeral("Invalid guess. Pick a number between 1 and 100."));
+        }
+
+        const gameId = `${guildId}:${setterId}:${guesserId}:${round}`;
+        const game = await getGame(gameId);
+        if (!game) return res.json(ephemeral("Game not found. The setter must set a number first."));
+
+        const newCount = game.guessCount + 1;
+        await saveGame(gameId, { ...game, guessCount: newCount });
+
+        if (guess === game.secret) {
+          await deleteGame(gameId);
+
+          if (round === 1) {
+            await saveGame(`r1result:${guildId}:${setterId}:${guesserId}`, { guessCount: newCount });
+
+            return res.json({
+              type: InteractionResponseType.ChannelMessageWithSource,
+              data: {
+                flags: COMPONENTS_V2_FLAG,
+                components: buildRoundResultComponents(setterId, guesserId, newCount, 1, guesserId, setterId),
+                allowed_mentions: { parse: [] },
+              },
+            });
+          } else {
+            const round1Data = await getGame(`r1result:${guildId}:${guesserId}:${setterId}`);
+            const p1Guesses = round1Data?.guessCount || 0;
+            const p2Guesses = newCount;
+
+            await deleteGame(`r1result:${guildId}:${guesserId}:${setterId}`);
+
+            let winnerId = null;
+            if (p1Guesses !== p2Guesses) {
+              winnerId = p1Guesses < p2Guesses ? guesserId : setterId;
+              await incrementWins(guildId, winnerId);
+            }
+
+            return res.json({
+              type: InteractionResponseType.ChannelMessageWithSource,
+              data: {
+                flags: COMPONENTS_V2_FLAG,
+                components: buildFinalResultComponents(guildId, guesserId, p1Guesses, setterId, p2Guesses, winnerId),
+                allowed_mentions: { parse: [] },
+              },
+            });
+          }
+        }
+
+        const hint = guess < game.secret ? "Go higher" : "Go lower";
+        return res.json({
+          type: InteractionResponseType.ChannelMessageWithSource,
+          data: {
+            flags: COMPONENTS_V2_FLAG,
+            components: buildGuessPrompt(guesserId, setterId, round, newCount, hint),
+            allowed_mentions: { parse: [] },
+          },
+        });
+      }
+    }
+
+    return res.status(400).end("Unknown interaction");
+
+  } catch (err) {
+    console.error("HANDLER ERROR:", err);
+    return res.status(500).end(err.message);
+  }
 }
