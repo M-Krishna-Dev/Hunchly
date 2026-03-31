@@ -9,6 +9,7 @@ const COMPONENTS_V2_FLAG = 1 << 15;
 const EPHEMERAL_FLAG = 1 << 6;
 
 let cachedClient = null;
+let cachedDb = null;
 
 function getRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -20,11 +21,17 @@ function getRawBody(req) {
 }
 
 async function getDb() {
-  if (!cachedClient) {
-    cachedClient = new MongoClient(MONGODB_URI);
-    await cachedClient.connect();
-  }
-  return cachedClient.db("numguess");
+  if (cachedDb) return cachedDb;
+
+  cachedClient = new MongoClient(MONGODB_URI, {
+    serverSelectionTimeoutMS: 2500,
+    connectTimeoutMS: 2500,
+    socketTimeoutMS: 2500,
+  });
+
+  await cachedClient.connect();
+  cachedDb = cachedClient.db("numguess");
+  return cachedDb;
 }
 
 async function getGamesCol() {
@@ -41,7 +48,7 @@ async function incrementWins(guildId, userId) {
   const col = await getLeaderboardCol();
   await col.updateOne(
     { guildId, userId },
-    { inc: { wins: 1 } },
+    { $inc: { wins: 1 } },
     { upsert: true }
   );
 }
